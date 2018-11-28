@@ -7,7 +7,7 @@ from tornado import websocket, web, ioloop, httpclient, httputil, gen
 import gmusicapi as gm
 import vlc
 
-VERSION = datetime.datetime.fromtimestamp(os.path.getmtime(__file__)).strftime('%Y%m%d')
+VERSION = datetime.datetime.fromtimestamp(os.path.getmtime(__file__)).strftime('%Y%m%d')[-5:]
 ROOT_PATH = os.path.dirname(os.path.realpath(__file__))
 
 # Class for saving and loading configuration files
@@ -132,7 +132,7 @@ class Library:
 
 # Class for requesting mp3 files
 class Requestor:
-	MAX_SIZE = 5
+	MAX_SIZE = 10
 	current_id = 0
 	minimum_id = 0
 	data = {}
@@ -243,7 +243,7 @@ class StreamHandler(web.RequestHandler):
 			return
 		
 		data = Requestor.get(self.name)
-		if len(data) < self.written + self.FRAME_SIZE:
+		if len(data) < min(self.written + self.FRAME_SIZE, Requestor.get_expected_size(self.name)):
 			ioloop.IOLoop.current().call_later(self.SLEEP_TIME, self.__write_frame)
 			return
 		
@@ -254,34 +254,45 @@ class StreamHandler(web.RequestHandler):
 
 # Class for requesting mp3 files
 class Player:
+	MAX_SIZE = 5
+	
 	player = vlc.MediaPlayer()
-	playing = {}
-	loading = False
+	queue = deque()
 	next = 0	# 0: Default +1: Loop -1: Skip
+	loading_count = 0
 
 	@classmethod
 	def update(cls):
-		# Check for next song
+		while len(cls.queue) < cls.MAX_SIZE:
+			song = Library.get()
+			cls.queue.append(song)
+			url = Library.geturl(song)
+			ioloop.IOLoop.current().add_callback(Requestor.request, song['id'], url)			
+			
 		if cls.next == -1:
 			cls.player.stop()
-		if not cls.loading and not cls.player.is_playing():
-			cls.loading = True
+			
+		if cls.loading_count == 0 and not cls.player.is_playing():
+			cls.loading_count = 10
 			if cls.next != 1:
-				cls.playing = Library.get()
-			url = Library.geturl(cls.playing) 
-			time.sleep(0.05)	# Make sure URL is available
-			ioloop.IOLoop.current().add_callback(Requestor.request, cls.playing['id'], url)
+				cls.queue.popleft()
+			
+			cls.next = 0
+			MessageHandler.send_ack('next', 0)
+
+			url = Library.geturl(cls.queue[0])
+			time.sleep(0.1)	# Make sure URL is available
 			cls.player.set_mrl(url)
 			cls.player.play()
-			cls.next = 0
-			MessageHandler.send_ack('pending', 0)
-			MessageHandler.send_update(cls.playing)
-		if cls.loading and cls.player.is_playing():
-			cls.loading = False
+			MessageHandler.send_update(cls.queue[0])
+		if cls.player.is_playing():
+			cls.loading_count = 0
+		else:
+			cls.loading_count -= 1
 
 	@classmethod
 	def getplaying(cls):
-		return cls.playing
+		return cls.queue[0]
 	
 	@classmethod
 	def gettime(cls):
@@ -348,16 +359,16 @@ class MessageHandler(websocket.WebSocketHandler):
 	def open(self):
 		self.clients.add(self)
 		self.write_message(self.__make_ack_msg('version', VERSION))
-		self.write_message(self.__make_ack_msg('pending', Player.getnext()))
+		self.write_message(self.__make_ack_msg('next', Player.getnext()))
 		self.write_message(self.__make_update_msg(Player.getplaying()))
 
 	def on_message(self, msg):
 		message = json.loads(msg)
-		if message['key'] == 'pending':
+		if message['key'] == 'next':
 			Player.setnext(message['value'])
-			self.send_ack('pending', Player.getnext())
+			self.send_ack('next', Player.getnext())
 		elif message['key'] == 'score':
-			library.setrank(message['value'])
+			Library.setrank(Player.getplaying(), message['value'])
 			self.send_ack('score', message['value'])
 		elif message['key'] == 'time':
 			self.send_ack('time', Player.gettime())
