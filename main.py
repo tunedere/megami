@@ -5,7 +5,6 @@ from functools import partial
 from collections import deque
 from tornado import websocket, web, ioloop, httpclient, httputil, gen
 import gmusicapi as gm
-import vlc
 
 VERSION = datetime.datetime.fromtimestamp(os.path.getmtime(__file__)).strftime('%Y%m%d')[-5:]
 ROOT_PATH = os.path.dirname(os.path.realpath(__file__))
@@ -256,10 +255,9 @@ class StreamHandler(web.RequestHandler):
 class Player:
 	MAX_SIZE = 5
 	
-	player = vlc.MediaPlayer()
 	queue = deque()
 	next = 0	# 0: Default +1: Loop -1: Skip
-	loading_count = 0
+	start_time = 0
 
 	@classmethod
 	def update(cls):
@@ -270,25 +268,18 @@ class Player:
 			ioloop.IOLoop.current().add_callback(Requestor.request, song['id'], url)			
 			
 		if cls.next == -1:
-			cls.player.stop()
+			cls.start_time = 0
+		if time.time() - cls.start_time > int(cls.getplaying()['durationMillis']) / 1000:
+			cls.start_time = 0
 			
-		if cls.loading_count == 0 and not cls.player.is_playing():
-			cls.loading_count = 10
+		if cls.start_time == 0:
 			if cls.next != 1:
 				cls.queue.popleft()
 			
 			cls.next = 0
 			MessageHandler.send_ack('next', 0)
-
-			url = Library.geturl(cls.queue[0])
-			time.sleep(0.1)	# Make sure URL is available
-			cls.player.set_mrl(url)
-			cls.player.play()
-			MessageHandler.send_update(cls.queue[0])
-		if cls.player.is_playing():
-			cls.loading_count = 0
-		else:
-			cls.loading_count -= 1
+			cls.start_time = time.time()
+			MessageHandler.send_update(cls.getplaying())
 
 	@classmethod
 	def getplaying(cls):
@@ -296,7 +287,7 @@ class Player:
 	
 	@classmethod
 	def gettime(cls):
-		return cls.player.get_time() / 1000
+		return time.time() - cls.start_time
 	
 	@classmethod
 	def getnext(cls):
