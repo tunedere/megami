@@ -36,9 +36,13 @@ class Config:
 # Class for managing music library
 class Library:
 	ALPHA = 2
+	RETRY_COUNT = 5
+	REFRESH_SEC = 60
+	AUTO_SAVE = True
 
 	path = ''
 	data = {}
+	last_refresh = 0
 	error_count = 0
 	api = gm.Mobileclient(debug_logging=False)
 	logged_in = False
@@ -69,8 +73,8 @@ class Library:
 			print('Error saving data file {}'.format(cls.path))
 
 	@classmethod
-	def login(cls, email, password, android_id):
-		cls.api.login(email, password, android_id)
+	def login(cls, device_id, oauth_credentials):
+		cls.api.oauth_login(device_id, oauth_credentials)
 		print('Login success!')
 		cls.logged_in = True
 		cls.refresh()
@@ -80,6 +84,9 @@ class Library:
 		if not cls.logged_in:
 			print('Not logged in!')
 			return
+		if time.time() - cls.last_refresh < cls.REFRESH_SEC:
+			return
+		
 		cls.library = cls.api.get_all_songs()
 		new_data = {}
 		for song in cls.library:
@@ -91,11 +98,17 @@ class Library:
 			else:
 				new_data[song['id']]['rank'] = 256
 		cls.data = new_data
+		cls.last_refresh = time.time()
+		
+		if cls.AUTO_SAVE:
+			cls.save()
 	
 	@classmethod
 	def get(cls):
 		if not cls.logged_in:
 			return
+
+		cls.refresh()
 		total = 0.0
 		for k, v in cls.data.items():
 			total += cls.ALPHA ** v['rank']
@@ -112,11 +125,13 @@ class Library:
 		except gm.exceptions.CallFailure:
 			cls.error_count += 1
 			cls.refresh()
-			if cls.error_count > 10:
+			if cls.error_count > cls.RETRY_COUNT:
 				cls.error_count = 0
 				print('Failed to fetch streaming URL!')
 				return ''
 			return cls.geturl(song)
+		finally:
+			cls.error_count = 0
 
 	@classmethod
 	def getrank(cls, song):
@@ -256,7 +271,7 @@ class Player:
 	MAX_SIZE = 5
 	
 	queue = deque()
-	next = 0	# 0: Default +1: Loop -1: Skip
+	act = 0	# 0: Default +1: Loop -1: Skip
 	start_time = 0
 
 	@classmethod
@@ -267,35 +282,41 @@ class Player:
 			url = Library.geturl(song)
 			ioloop.IOLoop.current().add_callback(Requestor.request, song['id'], url)			
 			
-		if cls.next == -1:
+		if cls.act == -1:
 			cls.start_time = 0
 		if time.time() - cls.start_time > int(cls.getplaying()['durationMillis']) / 1000:
 			cls.start_time = 0
 			
 		if cls.start_time == 0:
-			if cls.next != 1:
+			if cls.act != 1:
 				cls.queue.popleft()
+			if cls.act != 0:
+				cls.act = 0
+				MessageHandler.send_ack('act', 0)
 			
-			cls.next = 0
-			MessageHandler.send_ack('next', 0)
 			cls.start_time = time.time()
 			MessageHandler.send_update(cls.getplaying())
 
 	@classmethod
 	def getplaying(cls):
 		return cls.queue[0]
-	
+
+	@classmethod
+	def getqueued(cls, rank):
+		if rank < len(cls.queue):
+			return cls.queue[rank]
+		
 	@classmethod
 	def gettime(cls):
 		return time.time() - cls.start_time
 	
 	@classmethod
-	def getnext(cls):
-		return cls.next
+	def getact(cls):
+		return cls.act
 	
 	@classmethod
-	def setnext(cls, next):
-		cls.next = next
+	def setact(cls, act):
+		cls.act = act
 
 # Handler for sending and receving messsages through websocket
 class MessageHandler(websocket.WebSocketHandler):
@@ -313,21 +334,27 @@ class MessageHandler(websocket.WebSocketHandler):
 					print('Failed to send message {}!'.format(msg))
 					
 	@staticmethod
-	def __make_update_msg(song):
+	def __get_song_info(song):
 		message = {
-			'type': 'update',
 			'id': song['id'],
 			'title': song['title'],
 			'artist': song['artist'],
 			'album': song['album'],
-			'albumArt': '',
 			'duration': song['durationMillis'],
 			'score': Library.getrank(song),
 			'extra': song['comment'],
-			'time': Player.gettime()
 		}
 		if 'albumArtRef' in song:
 			message['albumArt'] = song['albumArtRef'][0]['url']
+		else:
+			message['albumArt'] = ''
+		return message
+
+	@staticmethod
+	def __make_update_msg(song):
+		message = MessageHandler.__get_song_info(song)
+		message['type'] = 'update'
+		message['time'] = Player.gettime()
 		return message
 
 	@classmethod
@@ -350,19 +377,24 @@ class MessageHandler(websocket.WebSocketHandler):
 	def open(self):
 		self.clients.add(self)
 		self.write_message(self.__make_ack_msg('version', VERSION))
-		self.write_message(self.__make_ack_msg('next', Player.getnext()))
+		self.write_message(self.__make_ack_msg('act', Player.getact()))
 		self.write_message(self.__make_update_msg(Player.getplaying()))
 
 	def on_message(self, msg):
 		message = json.loads(msg)
-		if message['key'] == 'next':
-			Player.setnext(message['value'])
-			self.send_ack('next', Player.getnext())
+		if message['key'] == 'act':
+			Player.setact(message['value'])
+			self.send_ack('act', Player.getact())
 		elif message['key'] == 'score':
 			Library.setrank(Player.getplaying(), message['value'])
 			self.send_ack('score', message['value'])
 		elif message['key'] == 'time':
 			self.send_ack('time', Player.gettime())
+		elif message['key'] == 'get':
+			message = MessageHandler.__get_song_info(Player.getqueued(message['value']))
+			message['type'] = 'ack'
+			message['key'] = 'get'
+			self.write_message(message)
 		else:
 			print('Unknown incoming message {}'.format(message))
 			
@@ -372,7 +404,7 @@ class MessageHandler(websocket.WebSocketHandler):
 # Init
 Config.load(os.path.join(ROOT_PATH, 'config.txt'))
 Library.load(os.path.join(ROOT_PATH, 'data.txt'))
-Library.login(Config.get('email'), Config.get('password'), Config.get('android_id'))
+Library.login(Config.get('device_id'), Config.get('oauth_credentials'))
 	
 # Start web server
 app = web.Application([
@@ -387,6 +419,4 @@ app.listen(Config.get('port'), ssl_options={
 })
 ioloop.PeriodicCallback(MessageHandler.broadcast, 50).start()
 ioloop.PeriodicCallback(Player.update, 150).start()
-ioloop.PeriodicCallback(Library.save, 60000).start()
-ioloop.PeriodicCallback(Library.refresh, 300000).start()
 ioloop.IOLoop.current().start()

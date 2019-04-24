@@ -1,5 +1,5 @@
 'use strict';
-const VERSION = 59;
+const VERSION = 62;
 
 const X_BLOCKS = 32;
 const Y_BLOCKS = 16;
@@ -13,6 +13,12 @@ const MAX_STAR = 7;
 
 var LATENCY = 0;
 var LYRIC_LATENCY = 0;
+
+// Web socket
+var ws;
+
+// Canvas context
+var canvasCtx;
 
 // Audio context
 const audioCtx = new window.AudioContext();
@@ -101,20 +107,32 @@ kuroshiro.init(new KuromojiAnalyzer({dictPath: 'dict'})).then(async function(){
 });
 
 // Convert second value to mm:ss format
-function secondToString(sec) {
+function secondToString(sec, centi) {
 	sec = Math.max(sec, 0)
 	const hour = Math.floor(sec / 3600);
 	let minute = Math.floor((sec / 60) % 60);
 	let second = Math.floor(sec % 60);
+	let centisecond = Math.floor((sec % 1) * 100);
 	minute = minute < 10 ? '0' + minute : minute;
 	second = second < 10 ? '0' + second : second;
-	return hour > 0 ? hour + ':' + minute + ':' + second : minute + ':' + second;
-}	
+	centisecond = centisecond < 10 ? '0' + centisecond : centisecond;
+
+	let result = hour > 0 ? hour + ':' + minute + ':' + second : minute + ':' + second;
+	if (centi) {
+		result += ('.' + centisecond);
+	}
+	return result;
+}
 
 // Convert mm:ss.ss to second
 function stringToSecond(str) {
 	const parsed = str.match(/([0-9]{2})\:([0-9]{2})\.([0-9]{2})/);
 	return parseInt(parsed[1]) * 60 + parseInt(parsed[2]) + parseInt(parsed[3]) / 100;
+}
+
+// Get current time in [mm:ss.ss] format
+function currentLrcTime(sec) {
+	return '[' + secondToString($('audio').prop('currentTime'), true) + ']';
 }
 
 // Set star colors
@@ -141,7 +159,7 @@ function clear() {
 };
 
 // Draw canvas background
-function draw(ctx, data) {
+function draw(data) {
 	for (let x = 0; x < X_BLOCKS; x++) {
 		for (let y = 0; y < Y_BLOCKS; y++) {
 			const index = y * X_BLOCKS + x;
@@ -150,8 +168,8 @@ function draw(ctx, data) {
 			const green = Math.floor(shuffledColorMap[index][1] * BRIGHTNESS[1] * value);
 			const blue = Math.floor(shuffledColorMap[index][2] * BRIGHTNESS[2] * value);
 			
-			ctx.fillStyle = 'rgb(' + red + ',' + green + ',' + blue + ')';
-			ctx.fillRect(x*canvas.width/X_BLOCKS, y*canvas.height/Y_BLOCKS, canvas.width/X_BLOCKS, canvas.height/Y_BLOCKS);
+			canvasCtx.fillStyle = 'rgb(' + red + ',' + green + ',' + blue + ')';
+			canvasCtx.fillRect(x*canvas.width/X_BLOCKS, y*canvas.height/Y_BLOCKS, canvas.width/X_BLOCKS, canvas.height/Y_BLOCKS);
 		}
 	}
 }
@@ -167,6 +185,14 @@ function getAudioLoader() {
 			console.log('Request skipped');
 		}
 	};
+}
+
+function getAveragePower(array) {
+	let totalPower = 0;
+	for (let i = 0; i < array.length; i++) {
+		totalPower += (array[i] - 128) * (array[i] - 128);
+	}
+	return Math.sqrt(totalPower / array.length);
 }
 
 var lyric = [];
@@ -207,7 +233,7 @@ async function parseLyric(message) {
 	return lyricArray;
 }
 
-function update(canvasCtx) {
+function update() {
 	const time = $('audio').prop('currentTime');
 	$('#time_cur').html(secondToString(time));
 	$('#progress').attr('value', time);
@@ -218,7 +244,7 @@ function update(canvasCtx) {
 			lyric.shift();
 		}
 		if (lyric.length > 0 && adjustedTime >= lyric[0][0]) {
-			$('#lyric-text').html(lyric[0][1]);			
+			$('#lyric-text').html(lyric[0][1]);
 		}
 		$('#lyric-hint').css('color', COLOR.HIGH);
 	}
@@ -226,12 +252,13 @@ function update(canvasCtx) {
 		$('#lyric-text').empty();
 		$('#lyric-hint').css('color', COLOR.LOW);
 	}
-			
+	
 	const freqData = new Uint8Array(analyser.frequencyBinCount);
 	const timeData = new Uint8Array(analyser.fftSize);
 	analyser.getByteFrequencyData(freqData);
 	analyser.getByteTimeDomainData(timeData);
-	draw(canvasCtx, freqData);
+	draw(freqData);
+	//console.log(getAveragePower(timeData));
 }
 
 $(function(){
@@ -261,17 +288,17 @@ $(function(){
 	$('audio').on('loadeddata', playAudio);
 	// Manual play button
 	$('#play').on('click', function(){
-		if ($('audio').prop('paused')) {
+		if (audioCtx.state != 'running') {
 			audioCtx.resume();
 			ws.update('time', 0);
 		}
 	});
 	
 	// Canvas context
-	var canvasCtx = document.getElementById("canvas").getContext("2d");
+	canvasCtx = document.getElementById('canvas').getContext('2d');
 
 	// WebSocket
-	var ws = new WebSocket('wss://ijk.moe:7650/socket');
+	ws = new WebSocket('wss://ijk.moe:7650/socket');
 	ws.onopen = function() {
 		console.log('Socket connected');
 		$('#misc').append('Client v' + VERSION + '<br>');
@@ -282,6 +309,7 @@ $(function(){
 	ws.onclose = function() {
 		console.log('Socket disconnected');
 		$('audio').get(0).pause();
+		clearInterval(update);
 		$('#wrapper').html('<span class="error">ERROR: Connection closed</span>');
 		$('#footer').html('');
 	};
@@ -304,8 +332,9 @@ $(function(){
 			$('#progress').attr('max', msg.duration / 1000);
 
 			lyric = msg.extra ? await parseLyric(msg.extra) : [];
-			
-			$('source').attr('src', '/get?t=' + new Date().getTime() + '&name=' + $('#id').html());
+			$('#lyric-text').empty();
+
+			$('source').attr('src', '/get?name=' + $('#id').html());
 			if (msg.time > LATENCY) {
 				$('audio').get(0).pause();
 				$('audio').get(0).load();
@@ -324,9 +353,9 @@ $(function(){
 			if (msg.key == 'version') {
 				$('#misc').append('Server v' + msg.value + '<br>');
 			}
-			else if (msg.key == 'next') {
-				$('#next-1').css('color', msg.value == -1 ? COLOR.HIGH : COLOR.LOW);
-				$('#next1').css('color', msg.value == 1 ? COLOR.HIGH : COLOR.LOW);
+			else if (msg.key == 'act') {
+				$('#act-1').css('color', msg.value == -1 ? COLOR.HIGH : COLOR.LOW);
+				$('#act1').css('color', msg.value == 1 ? COLOR.HIGH : COLOR.LOW);
 			}
 			else if (msg.key == 'score') {
 				$('#star').attr('score', msg.value);
@@ -335,6 +364,9 @@ $(function(){
 			else if (msg.key == 'time') {
 				$('audio').prop('currentTime', msg.value - LATENCY);
 				playAudio();
+			}
+			else if (msg.key == 'get') {
+				console.log(msg);
 			}
 		}
 	};
@@ -350,7 +382,7 @@ $(function(){
 		$('#main').css('max-width', mainWidth + 'px');
 	}
 	else {
-		$('#main').css('max-width', totalWidth + 'px');		
+		$('#main').css('max-width', totalWidth + 'px');
 	}
 
 	// Volume slider
@@ -360,16 +392,16 @@ $(function(){
 		gainNode.gain.value = ($(this).val() / 100) ** 2;
 	});
 
-	// Next button handler
-	function setNext(value) {
+	// Act button handler
+	function setAct(value) {
 		if ((value != 1) && (value != -1)) {
 			return;
-		}	
-		$('#next' + value).css('color', COLOR.HIGH);
-		ws.update('next', value);
+		}
+		$('#act' + value).css('color', COLOR.HIGH);
+		ws.update('act', value);
 	}
-	$('#next1').on('click', setNext.bind(null, 1));
-	$('#next-1').on('click', setNext.bind(null, -1));
+	$('#act1').on('click', setAct.bind(null, 1));
+	$('#act-1').on('click', setAct.bind(null, -1));
 	
 	// Set stars behaviour
 	for (let i = 1; i <= MAX_STAR; i++) {
@@ -403,12 +435,12 @@ $(function(){
 		//+
 		else if (e.which == 107 || e.which == 187) {
 			e.preventDefault();
-			setNext(+1);
+			setAct(+1);
 		}
 		//-
 		else if (e.which == 109 || e.which == 189) {
 			e.preventDefault();
-			setNext(-1);
+			setAct(-1);
 		}
 		else if (e.which == 90) {
 			e.preventDefault();
@@ -421,5 +453,5 @@ $(function(){
 	});
 
 	clear();
-	setInterval(update.bind(null, canvasCtx), 100);
+	setInterval(update, 100);
 });
